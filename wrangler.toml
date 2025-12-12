@@ -1,0 +1,6 @@
+name = "coronal-hole-worker"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[vars]
+# you can add env vars here later if you want
