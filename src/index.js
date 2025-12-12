@@ -2,15 +2,15 @@ import jpeg from "jpeg-js";
 import UPNG from "upng-js";
 
 /**
- * Coronal Hole Locator Worker (FULL COLOUR + /img endpoint)
+ * Coronal Hole Locator Worker (FULL COLOUR + LINED POLYGONS)
  *
- * - GET /img  -> image/png (colour 193Å with cyan CH edges)
- * - GET /     -> JSON with polygons + base64 PNG
+ * - GET /img  -> image/png (colour 193Å with cyan CH outlines)
+ * - GET /     -> JSON with polygons + contours + base64 PNG
  */
 
 const TARGET_SIZE = 512;    // analysis size
-const CH_THRESHOLD = 80;    // luminance threshold for "dark"
-const SOLAR_RADIUS = 0.43;  // smaller radius to avoid outer ring
+const CH_THRESHOLD = 50;    // stricter luminance threshold (less sensitive)
+const SOLAR_RADIUS = 0.43;  // fraction of width for disk mask
 
 export default {
   async fetch(request, env, ctx) {
@@ -19,7 +19,7 @@ export default {
       const result = await generateCoronalHolePNG();
 
       if (url.pathname === "/img") {
-        // raw PNG for direct viewing
+        // Raw PNG for direct viewing
         return new Response(result.pngBuffer, {
           headers: {
             "Content-Type": "image/png",
@@ -37,8 +37,9 @@ export default {
             timestamp: result.timestamp,
             original_dimensions: result.originalDimensions,
             processed_dimensions: result.processedDimensions,
-            polygon_count: result.polygons.length,
-            coronal_holes_polygons: result.polygons,
+            polygon_count: result.edgePoints.length,
+            coronal_holes_polygons: result.edgePoints,
+            contours_scaled: result.contoursScaled,
             image_data: `data:image/png;base64,${result.base64}`
           },
           null,
@@ -77,12 +78,11 @@ export default {
 };
 
 /**
- * Fetch AIA 193 JPEG, detect CH edges using luminance, overlay them on
- * the ORIGINAL colour image, and return PNG buffer + metadata.
+ * Fetch AIA 193 JPEG, detect CH edges using luminance, group them into
+ * contours, draw outlines on the ORIGINAL colour image, and return PNG.
  */
 async function generateCoronalHolePNG() {
-  // Fixed example date; we can parameterise later if you want.
-  const DATE_PATH = "2025/12/11";
+  const DATE_PATH = "2025/12/11"; // fixed for now
   const IMAGE_URL = `https://suntoday.lmsal.com/sdomedia/SunInTime/${DATE_PATH}/f0193.jpg`;
 
   const resp = await fetch(IMAGE_URL, {
@@ -109,7 +109,7 @@ async function generateCoronalHolePNG() {
 
   // Output colour buffer
   const rgba = new Uint8Array(outW * outH * 4);
-  // Separate luminance buffer for CH detection
+  // Luminance buffer for CH detection
   const lumBuf = new Uint8Array(outW * outH);
 
   let dst = 0;
@@ -126,13 +126,13 @@ async function generateCoronalHolePNG() {
       const b = data[srcIdx + 2];
       const a = data[srcIdx + 3];
 
-      // Keep original colour in rgba
+      // Keep original colour
       rgba[dst++] = r;
       rgba[dst++] = g;
       rgba[dst++] = b;
       rgba[dst++] = a;
 
-      // Compute luminance (no log for colour; we just use straight lum)
+      // Luminance (0–255)
       let lum = 0.299 * r + 0.587 * g + 0.114 * b;
       lum = lum < 0 ? 0 : lum > 255 ? 255 : lum;
       lumBuf[li++] = lum;
@@ -143,18 +143,12 @@ async function generateCoronalHolePNG() {
   const centerX = outW / 2;
   const centerY = outH / 2;
   const maxRadiusSq = (outW * SOLAR_RADIUS) ** 2;
-  const polygons = [];
+
+  const edgeMask = new Uint8Array(outW * outH); // 1 where edge pixel
+  const edgePoints = []; // scaled to original-res for compatibility
 
   function getLumAt(x, y) {
     return lumBuf[y * outW + x];
-  }
-
-  function setPixelColour(x, y, R, G, B) {
-    const idx = (y * outW + x) * 4;
-    rgba[idx] = R;
-    rgba[idx + 1] = G;
-    rgba[idx + 2] = B;
-    rgba[idx + 3] = 255;
   }
 
   for (let y = 1; y < outH - 1; y++) {
@@ -172,12 +166,22 @@ async function generateCoronalHolePNG() {
           getLumAt(x, y + 1) >= CH_THRESHOLD;
 
         if (isEdge) {
-          polygons.push({ x: x * step, y: y * step });
-
-          // Overlay on colour image in cyan
-          setPixelColour(x, y, 0, 255, 255);
+          edgeMask[y * outW + x] = 1;
+          edgePoints.push({ x: x * step, y: y * step });
         }
       }
+    }
+  }
+
+  // Extract contours (polylines) from edgeMask
+  const contours = extractContours(edgeMask, outW, outH);
+
+  // Draw lines for each contour onto the colour buffer
+  for (const contour of contours) {
+    for (let i = 1; i < contour.length; i++) {
+      const p0 = contour[i - 1];
+      const p1 = contour[i];
+      drawLine(rgba, outW, outH, p0.x, p0.y, p1.x, p1.y, 0, 255, 255); // cyan
     }
   }
 
@@ -186,16 +190,123 @@ async function generateCoronalHolePNG() {
   const pngUint8 = new Uint8Array(pngArrayBuffer);
   const base64 = uint8ToBase64(pngUint8);
 
+  // Scale contours back to original-res coordinates for JSON
+  const contoursScaled = contours.map(contour =>
+    contour.map(p => ({ x: p.x * step, y: p.y * step }))
+  );
+
   return {
     pngBuffer: pngArrayBuffer,
     base64,
-    polygons,
+    edgePoints,
+    contoursScaled,
     source: resp.url,
     timestamp: new Date().toISOString(),
     originalDimensions: { width, height },
     processedDimensions: { width: outW, height: outH, step }
   };
 }
+
+/* ---------- contour extraction (very simple chaining) ---------- */
+
+function extractContours(edgeMask, w, h) {
+  const visited = new Uint8Array(w * h);
+  const contours = [];
+
+  const neighbors = [
+    [-1, 0],  // W
+    [-1, -1], // NW
+    [0, -1],  // N
+    [1, -1],  // NE
+    [1, 0],   // E
+    [1, 1],   // SE
+    [0, 1],   // S
+    [-1, 1]   // SW
+  ];
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = y * w + x;
+      if (!edgeMask[idx] || visited[idx]) continue;
+
+      const contour = [];
+      let cx = x;
+      let cy = y;
+      visited[idx] = 1;
+      contour.push({ x: cx, y: cy });
+
+      // Simple chain-following
+      while (true) {
+        let found = false;
+
+        for (let k = 0; k < neighbors.length; k++) {
+          const nx = cx + neighbors[k][0];
+          const ny = cy + neighbors[k][1];
+
+          if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+          const nIdx = ny * w + nx;
+          if (edgeMask[nIdx] && !visited[nIdx]) {
+            visited[nIdx] = 1;
+            contour.push({ x: nx, y: ny });
+            cx = nx;
+            cy = ny;
+            found = true;
+            break;
+          }
+        }
+
+        if (!found) break;
+      }
+
+      // Ignore very short contours (noise)
+      if (contour.length >= 5) {
+        contours.push(contour);
+      }
+    }
+  }
+
+  return contours;
+}
+
+/* ---------- drawing helpers ---------- */
+
+function drawLine(rgba, w, h, x0, y0, x1, y1, R, G, B) {
+  x0 = Math.round(x0);
+  y0 = Math.round(y0);
+  x1 = Math.round(x1);
+  y1 = Math.round(y1);
+
+  let dx = Math.abs(x1 - x0);
+  let dy = Math.abs(y1 - y0);
+  let sx = x0 < x1 ? 1 : -1;
+  let sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+
+  while (true) {
+    setPixelColourSafe(rgba, w, h, x0, y0, R, G, B);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) {
+      err -= dy;
+      x0 += sx;
+    }
+    if (e2 < dx) {
+      err += dx;
+      y0 += sy;
+    }
+  }
+}
+
+function setPixelColourSafe(rgba, w, h, x, y, R, G, B) {
+  if (x < 0 || x >= w || y < 0 || y >= h) return;
+  const idx = (y * w + x) * 4;
+  rgba[idx] = R;
+  rgba[idx + 1] = G;
+  rgba[idx + 2] = B;
+  rgba[idx + 3] = 255;
+}
+
+/* ---------- misc ---------- */
 
 function uint8ToBase64(u8) {
   const CHUNK = 0x8000;
