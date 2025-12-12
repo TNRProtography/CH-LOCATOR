@@ -1,15 +1,18 @@
 {
   "name": "coronal-hole-worker",
   "version": "1.0.0",
-  "private": true,
+  "description": "Cloudflare Worker that detects coronal holes and outputs a PNG with polygon overlay",
+  "type": "module",
+  "main": "src/index.js",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "jpeg-js": "^0.4.4"
+    "jpeg-js": "^0.4.4",
+    "upng-js": "^2.1.0"
   },
   "devDependencies": {
-    "wrangler": "^4.54.0"
+    "wrangler": "^4.0.0"
   }
 }
