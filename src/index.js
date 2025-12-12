@@ -9,8 +9,8 @@ import UPNG from "upng-js";
  */
 
 const TARGET_SIZE = 512;    // analysis size
-const CH_THRESHOLD = 25;    // 15% less sensitive to dark patches
-const SOLAR_RADIUS = 0.25;  // fraction of width for disk mask
+const CH_THRESHOLD = 35;    // 15% less sensitive to dark patches
+const SOLAR_RADIUS = 0.50;  // fraction of width for disk mask
 
 
 export default {
